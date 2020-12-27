@@ -16,60 +16,92 @@ module.exports = async function (client, options) {
   }
 
   const yggdrasilClient = yggdrasil({ agent: options.agent, host: options.authServer || 'https://authserver.mojang.com' })
-  const clientToken = options.clientToken || (options.session && options.session.clientToken) || (options.profilesFolder && (await getLauncherProfiles()).clientToken) || UUID.v4().toString().replace(/-/g, '')
+  const clientToken = options.clientToken || (options.session && options.session.clientToken) || (options.profilesFolder && (await getAuthDatabase()).clientToken) || UUID.v4().toString().replace(/-/g, '')
   const skipValidation = false || options.skipValidation
   options.accessToken = null
   options.haveCredentials = !!options.password || (clientToken != null && options.session != null) || (options.profilesFolder && await hasProfileCredentials())
 
-  async function getLauncherProfiles () { // get launcher profiles
+  async function getAuthDatabase () { // get launcher_accounts.json, or launcher_profiles.json if it doesn't exist
+    let oldFormat
     try {
-      return JSON.parse(await fs.readFile(path.join(options.profilesFolder, 'launcher_profiles.json'), 'utf8'))
+      await fs.access(path.join(options.profilesFolder, 'launcher_accounts.json'))
+      // Use new format
+      oldFormat = false
+    } catch (err) {
+      // File does not exist - use old format
+      oldFormat = true
+    }
+    const fileName = oldFormat ? 'launcher_profiles.json' : 'launcher_accounts.json'
+
+    try {
+      return {
+        oldFormat: oldFormat,
+        fileName: fileName,
+        content: JSON.parse(await fs.readFile(path.join(options.profilesFolder, fileName), 'utf8'))
+      }
     } catch (err) {
       await fs.mkdir(options.profilesFolder, { recursive: true })
-      await fs.writeFile(path.join(options.profilesFolder, 'launcher_profiles.json'), '{}')
-      return { authenticationDatabase: {} }
+      await fs.writeFile(path.join(options.profilesFolder, fileName), '{}')
+      return {
+        oldFormat: oldFormat,
+        fileName: fileName,
+        content: { authenticationDatabase: {} }
+      }
     }
   }
 
   async function hasProfileCredentials () {
     try {
-      const auths = await getLauncherProfiles()
-
-      const lowerUsername = options.username.toLowerCase()
-      return !!Object.keys(auths.authenticationDatabase).find(key =>
-        auths.authenticationDatabase[key].username.toLowerCase() === lowerUsername ||
-          Object.values(auths.authenticationDatabase[key].profiles)[0].displayName.toLowerCase() === lowerUsername
-      )
+      const auths = await getAuthDatabase()
+      return !!getProfile(auths, options.username)
     } catch (err) {
       return false
     }
+  }
+
+  function getProfile (auths, username) {
+    const lowerUsername = username.toLowerCase()
+    const accountData = auths.oldFormat ? auths.content.authenticationDatabase : auths.content.accounts
+
+    return Object.keys(accountData).find(key =>
+      accountData[key].username.toLowerCase() === lowerUsername ||
+      (auths.oldFormat && Object.values(accountData[key].profiles)[0].displayName.toLowerCase() === lowerUsername) ||
+      (!auths.oldFormat && accountData[key].minecraftProfile.name.toLowerCase() === lowerUsername)
+    )
   }
 
   if (options.haveCredentials) {
     // make a request to get the case-correct username before connecting.
     const cb = function (err, session) {
       if (options.profilesFolder) {
-        getLauncherProfiles().then((auths) => {
+        getAuthDatabase().then((auths) => {
           try {
-            const lowerUsername = options.username.toLowerCase()
-            let profile = Object.keys(auths.authenticationDatabase).find(key =>
-              auths.authenticationDatabase[key].username.toLowerCase() === lowerUsername ||
-                Object.values(auths.authenticationDatabase[key].profiles)[0].displayName.toLowerCase() === lowerUsername
-            )
+            let profile = getProfile(auths, options.username)
             if (err) {
               if (profile) { // profile is invalid, remove
-                delete auths.authenticationDatabase[profile]
+                if (auths.oldFormat) {
+                  delete auths.content.authenticationDatabase[profile]
+                } else {
+                  delete auths.content.accounts[profile]
+                }
               }
             } else { // successful login
               if (!profile) {
                 profile = UUID.v4().toString().replace(/-/g, '') // create new profile
               }
-              if (!auths.clientToken) {
-                auths.clientToken = clientToken
+
+              if (auths.oldFormat) {
+                if (!auths.content.clientToken) {
+                  auths.content.clientToken = clientToken
+                }
+              } else {
+                if (!auths.content.accounts.mojangClientToken) {
+                  auths.content.accounts.mojangClientToken = clientToken
+                }
               }
 
-              if (clientToken === auths.clientToken) { // only do something when we can save a new clienttoken or they match
-                const oldProfileObj = auths.authenticationDatabase[profile]
+              if (clientToken === (auths.oldFormat ? auths.content.clientToken : auths.content.accounts.mojangClientToken)) { // only do something when we can save a new clienttoken or they match
+                const oldProfileObj = auths.content.authenticationDatabase[profile]
                 const newProfileObj = {
                   accessToken: session.accessToken,
                   profiles: {},
@@ -79,13 +111,17 @@ module.exports = async function (client, options) {
                 newProfileObj.profiles[session.selectedProfile.id] = {
                   displayName: session.selectedProfile.name
                 }
-                auths.authenticationDatabase[profile] = newProfileObj
+                if (auths.oldFormat) {
+                  auths.content.authenticationDatabase[profile] = newProfileObj
+                } else {
+                  auths.content.accounts[profile] = newProfileObj
+                }
               }
             }
           } catch (ignoreErr) {
             // again, silently fail, just don't save anything
           }
-          fs.writeFile(path.join(options.profilesFolder, 'launcher_profiles.json'), JSON.stringify(auths, null, 2)).then(() => {}, (ignoreErr) => {
+          fs.writeFile(path.join(options.profilesFolder, auths.fileName), JSON.stringify(auths.content, null, 2)).then(() => {}, (ignoreErr) => {
             // console.warn("Couldn't save tokens:\n", err) // not any error, we just don't save the file
           })
         }, (ignoreErr) => {
@@ -106,26 +142,23 @@ module.exports = async function (client, options) {
 
     if (!options.session && options.profilesFolder) {
       try {
-        const auths = await getLauncherProfiles()
+        const auths = await getAuthDatabase()
 
-        const lowerUsername = options.username.toLowerCase()
-        const profile = Object.keys(auths.authenticationDatabase).find(key =>
-          auths.authenticationDatabase[key].username.toLowerCase() === lowerUsername ||
-            Object.values(auths.authenticationDatabase[key].profiles)[0].displayName.toLowerCase() === lowerUsername
-        )
+        const profile = getProfile(auths, options.username)
+        const accountData = auths.oldFormat ? auths.content.authenticationDatabase : auths.content.accounts
 
         if (profile) {
-          const newUsername = auths.authenticationDatabase[profile].username
-          const uuid = Object.keys(auths.authenticationDatabase[profile].profiles)[0]
-          const displayName = auths.authenticationDatabase[profile].profiles[uuid].displayName
+          const newUsername = accountData[profile].username
+          const uuid = auths.oldFormat ? Object.keys(accountData[profile].profiles)[0] : accountData[profile].minecraftProfile.id
+          const displayName = auths.oldFormat ? accountData[profile].profiles[uuid].displayName : accountData[profile].minecraftProfile.name
           const newProfile = {
             name: displayName,
             id: uuid
           }
 
           options.session = {
-            accessToken: auths.authenticationDatabase[profile].accessToken,
-            clientToken: auths.clientToken,
+            accessToken: accountData[profile].accessToken,
+            clientToken: auths.oldFormat ? auths.content.clientToken : auths.content.accounts.mojangClientToken,
             selectedProfile: newProfile,
             availableProfiles: [newProfile]
           }
