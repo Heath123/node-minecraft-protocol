@@ -158,7 +158,7 @@ module.exports = async function (client, options) {
 
           options.session = {
             accessToken: accountData[profile].accessToken,
-            clientToken: auths.oldFormat ? auths.content.clientToken : auths.content.accounts.mojangClientToken,
+            clientToken: auths.oldFormat ? auths.content.clientToken : auths.content.mojangClientToken,
             selectedProfile: newProfile,
             availableProfiles: [newProfile]
           }
