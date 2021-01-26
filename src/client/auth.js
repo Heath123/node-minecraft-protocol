@@ -75,6 +75,7 @@ module.exports = async function (client, options) {
     const cb = function (err, session) {
       if (options.profilesFolder) {
         getAuthDatabase().then((auths) => {
+          if (!auths.authenticationDatabase) auths.authenticationDatabase = []
           try {
             let profile = getProfile(auths, options.username)
             if (err) {
